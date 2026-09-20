@@ -1,7 +1,6 @@
 #include <algorithm>
 #include <unordered_set>
 #include <vector>
-#include <unordered_map>
 #include <string>
 #include <memory>
 #include <functional>
@@ -18,8 +17,8 @@ struct Hash
 
 class Value : public std::enable_shared_from_this<Value>
 {
-//private:
-public:
+private:
+// public:
     inline static size_t        s_currentID{0};
     float                       m_data{};
     float                       m_grad{};
@@ -31,6 +30,10 @@ private:
     Value(float data, const std::string &op, size_t id)
         : m_data{data}, m_op{op}, m_id{id} {}
 public:
+    const std::string           &getOp() const { return m_op; }
+    int                         getData() const { return m_data; }
+    float                       getGrad() const { return m_grad; }
+
     // we don't want clients to call directly to constructor instead to member function
     // a.k.a. we exposed some API for constructor
     static ValuePtr create(float data, const std::string &op = "")
@@ -189,7 +192,7 @@ public:
 
 size_t Hash::operator()(const ValuePtr value) const
 {
-    return std::hash<std::string>()(value.get()->m_op) ^ std::hash<float>()(value.get()->m_data);
+    return std::hash<std::string>()(value.get()->getOp()) ^ std::hash<float>()(value.get()->getData());
 }
 
 int main()
@@ -198,18 +201,15 @@ int main()
     auto b{ Value::create(2.0, "") };
 
     auto c { Value::add(a, b) };
-    std::cout << "c grad: " << c->m_grad << '\n';
     auto d { Value::multiply(c, c) };
-    std::cout << "d grad: " << d->m_grad << '\n';
 
-    assert(c->m_data == 3.0);
-    assert(c->m_op == "+");
+    assert(c->getData()== 3.0);
+    assert(c->getOp() == "+");
 
-    assert(d->m_data == 9.0);
-    assert(d->m_op == "*");
+    assert(d->getData() == 9.0);
+    assert(d->getOp() == "*");
 
     auto l{ Value::add(d, d) };
-    std::cout << "l grad: " << l->m_grad << '\n';
     l->backProp();
 
     // auto a { std::shared_ptr<Value>() };
