@@ -34,9 +34,9 @@ private:
     Value(float data, const std::string &op, size_t id)
         : m_data{data}, m_op{op}, m_id{id} {}
 public:
-    const std::string           &getOp() const { return m_op; }
-    float                       getData() const { return m_data; }
-    float                       getGrad() const { return m_grad; }
+    const std::string           &getOp()    const { return m_op; }
+    float                       getData()   const { return m_data; }
+    float                       getGrad()   const { return m_grad; }
 
     void                        setGrad(float grad) { m_grad = grad; } 
     // don't want clients to call directly to constructor
@@ -52,47 +52,60 @@ public:
         --Value::s_currentID;
     }
 
+    //  out = lhs + rhs
+    //  d(out)/d(lhs) = 1; d(out)/d(rhs) = 1
+    //  d(L)/d(lhs) = d(L)/d(out) * d(out)/d(lhs) = d(L)/d(out)
+    //  d(L)/d(rhs) = d(L)/d(out) * d(out)/d(rhs) = d(L)/d(out)
     static ValuePtr
     add(const ValuePtr &lhs, const ValuePtr &rhs)
     {
         auto out{ Value::create(lhs->m_data + rhs->m_data, "+") };
-        out->m_prev = {lhs, rhs};
+        out->m_prev = {lhs, rhs};   // push_back(lhs and rhs)
         out->f_backward = [
-            lhs_weak = std::weak_ptr<Value>(lhs),
-            rhs_weak = std::weak_ptr<Value>(rhs),
-            out_weak = std::weak_ptr<Value>(out)
+            lhs_weak = lhs->weak_from_this(),
+            rhs_weak = rhs->weak_from_this(),
+            out_weak = out->weak_from_this()
         ](){
+            // lock() used to temp acquire ownership
             lhs_weak.lock()->m_grad += out_weak.lock()->m_grad;
             rhs_weak.lock()->m_grad += out_weak.lock()->m_grad;
         };
         return out;
     }
 
+    //  out = lhs * rhs
+    //  d(out)/d(lhs) = rhs; d(out)/d(rhs) = lhs
+    //  d(L)/d(lhs) = d(L)/d(out) * d(out)/d(lhs) -> rhs
+    //  d(L)/d(rhs) = d(L)/d(out) * d(out)/d(rhs) -> lhs 
     static ValuePtr
     multiply(const ValuePtr &lhs, const ValuePtr &rhs)
     {
         auto out{ Value::create(lhs->m_data * rhs->m_data, "*") };
         out->m_prev = {lhs, rhs};
         out->f_backward = [
-            lhs_weak = std::weak_ptr<Value>(lhs),
-            rhs_weak = std::weak_ptr<Value>(rhs),
-            out_weak = std::weak_ptr<Value>(out)
+            lhs_weak = lhs->weak_from_this(),
+            rhs_weak = rhs->weak_from_this(),
+            out_weak = out->weak_from_this() 
         ](){ 
-            lhs_weak.lock()->m_grad += rhs_weak.lock()->m_data * out_weak.lock()->m_grad;
-            rhs_weak.lock()->m_grad += lhs_weak.lock()->m_data * out_weak.lock()->m_grad;
+            lhs_weak.lock()->m_grad += out_weak.lock()->m_grad * rhs_weak.lock()->m_data;
+            rhs_weak.lock()->m_grad += out_weak.lock()->m_grad *  lhs_weak.lock()->m_data;
         };
         return out;
     }
 
+    //  out = lhs - rhs
+    //  d(out)/d(lhs) = 1; d(out)/d(rhs) = -1
+    //  d(L)/d(lhs) = d(L)/d(out) * d(out)/d(lhs) = d(L)/d(out)
+    //  d(L)/d(rhs) = d(L)/d(out) * d(out)/d(rhs) = -d(L)/d(out)
     static ValuePtr
     subtract(const ValuePtr &lhs, const ValuePtr &rhs)
     {
         auto out{ Value::create(lhs->m_data - rhs->m_data, "-") };
         out->m_prev = {lhs, rhs};
         out->f_backward = [
-            lhs_weak = std::weak_ptr<Value>(lhs),
-            rhs_weak = std::weak_ptr<Value>(rhs),
-            out_weak = std::weak_ptr<Value>(out)
+            lhs_weak = lhs->weak_from_this(),
+            rhs_weak = rhs->weak_from_this(),
+            out_weak = out->weak_from_this() 
         ](){
             lhs_weak.lock()->m_grad += out_weak.lock()->m_grad;
             rhs_weak.lock()->m_grad -= out_weak.lock()->m_grad;
@@ -100,9 +113,9 @@ public:
         return out;
     }
 
-    // out = base^exponent
+    //  out = base^exponent
+    //  d(out)/d(base) = exponent * base^(exponent-1)
     // dL/d(base) = dL/d(out) * d(out)/d(base)
-    //            = out->grad * exponent * base^(exponent-1)
     static ValuePtr
     pow(const ValuePtr &base, float exp)
     {
@@ -110,16 +123,16 @@ public:
         auto out{ Value::create(newValue, "^") };
         out->m_prev = { base };
         out->f_backward = [
-            base_weak = std::weak_ptr<Value>(base),
-            exp,
-            out_weak = std::weak_ptr<Value>(out)
+            base_weak = base->weak_from_this(),
+            out_weak = out->weak_from_this(),
+            exp
         ]() {
-            if(auto base = base_weak.lock())
-                base->m_grad += exp * std::pow(base->m_data, exp-1);
+            base_weak.lock()->m_grad += out_weak.lock()->m_grad * exp * std::pow(base_weak.lock()->m_data, exp-1);
         };
         return out;
     }
 
+    //  out = num/denum -> out = num * denum^(-1)
     static ValuePtr
     divide(const ValuePtr &num, const ValuePtr &denum)
     {
@@ -127,43 +140,46 @@ public:
         return Value::multiply(num, reciprocal);
     }
 
-    // f(x) = max(0, x)
-    // when x > 0 : y = x, so dy/dx = 1
-    // when x < 0 : y = 0, so dy/dx = 0
+    // out = max(0, inp)
+    // when out > 0 : out = inp, so d(out)/d(inp) = 1
+    // when out < 0 : out = 0, so d(out)/d(inp) = 0
+    // dL/d(inp) = dL/d(out) * d(out)/d(inp)
     static ValuePtr
     relu(const ValuePtr& inp)
     {
         float val{ std::max(0.0f, inp->m_data) };
         auto out{ Value::create(val, "relu") };
         out->m_prev = { inp };
+
         out->f_backward = [
-            inp,
-            out
+            inp_weak = inp->weak_from_this(),
+            out_weak = out->weak_from_this()
         ]() {
-            if(inp)
-                // since total gradient is combination of
-                // local gradient and outward gradient
-                inp->m_grad += (out->m_data > 0) * out->m_grad;
+            inp_weak.lock()->m_grad += out_weak.lock()->m_grad * (out_weak.lock()->m_data > 0);
         };
         return out;
     }
     
-    // f(x) = 1/(1+e^(-x))
-    // f'(x) = f(x) * (1 - f(x))
+    //  out = 1/(1+e^(-inp))
+    //  d(out)/d(in) = out * (1 - out)
+    //  dL/d(inp) = dL/d(out) * d(out)/d(inp)
     static ValuePtr
     sigmoid(const ValuePtr& inp)
     {
         float val{ 1.0f/(1.0f + std::exp(-inp->m_data)) };
+
         if(inp->m_data < 0)     // prevents overflow when x is highly negative
             val = std::exp(inp->m_data) / (1.0f + std::exp(inp->m_data)); 
+
         auto out{ Value::create(val, "sigmoid") };
         out->m_prev = { inp };
+
         out->f_backward = [
-            inp,
-            out,
+            inp_weak = inp->weak_from_this(),
+            out_weak = out->weak_from_this(),
             val
         ]() {
-            inp->m_grad += val * (1.0f - val);
+            inp_weak.lock()->m_grad += out_weak.lock()->m_grad * val * (1.0f - val);
         };
         return out;
     }
@@ -323,21 +339,63 @@ public:
 };
 
 
+class Layer
+{
+private:
+    std::vector<Neuron> m_neurons{};
+
+public:
+    Layer(size_t neuronDim, size_t neuronCount, const ActivationType &actt = ActivationType::relu)
+    {
+        for (size_t i{0}; i < neuronCount; ++i)
+            m_neurons.emplace_back( Neuron{neuronDim, actt} );
+    }
+
+    std::vector<ValuePtr>
+    operator()(const std::vector<ValuePtr> &x)
+    {
+        std::vector<ValuePtr> out;
+        out.reserve(m_neurons.size());
+        std::for_each(m_neurons.begin(), m_neurons.end(),
+                      [&](auto neuron) {
+                        out.emplace_back(neuron(x));
+                      });
+        return out;
+    }
+
+    void
+    zeroNeuron()
+    {
+        for(auto& n : m_neurons)
+            n.zeroGrad();
+    }
+
+    std::vector<Value*>
+    parameters() const
+    {
+        std::vector<Value*> params{};
+        if (params.empty())
+            for (const auto &n : m_neurons )
+                for (const auto &p : n.params())
+                    params.push_back(p.get());
+        return params;
+    }
+
+    void
+    print()
+    {
+        const auto params{parameters()};
+        printf("Num parameters: %d\n", (int)params.size());
+        for (const auto& p : params) {
+            std::cout << &p << " ";
+            printf("[data:%f,grad=%lf]\n", p->getData(), p->getGrad());
+        }
+        std::cout << '\n';
+    }
+};
+
 int main()
 {
-    auto a{ Value::create(1.0, "") };
-    auto b{ Value::create(2.0, "") };
-
-    auto c { Value::add(a, b) };
-    auto d { Value::multiply(c, c) };
-
-    assert(c->getData()== 3.0);
-    assert(c->getOp() == "+");
-
-    assert(d->getData() == 9.0);
-    assert(d->getOp() == "*");
-
-    auto l{ Value::add(d, d) };
-    l->backProp();
-
+    Layer l1{4, 2};
+    l1.print();
 }
